@@ -220,27 +220,31 @@ def error_excerpt(text, limit=60):
     return "\n".join(picked[:limit]) or tail(text, 40)
 
 
+def log_text(path):
+    text = read(path)
+    if path.name == "build.log":
+        rows = text.splitlines()
+        kept = [row for row in rows if not NINJA_PROGRESS.match(row)]
+        if len(kept) < len(rows):
+            text = f"({len(rows) - len(kept)} ninja progress lines removed)\n" + "\n".join(kept) + "\n"
+    data = text.encode()
+    if len(data) > MAX_LOG_BYTES:
+        head, tail = data[:MAX_LOG_BYTES // 3], data[-(MAX_LOG_BYTES * 2 // 3):]
+        text = (head.decode(errors="ignore") + f"\n\n… {len(data) - len(head) - len(tail)} bytes cut; "
+                "the full file is on the test machine …\n\n" + tail.decode(errors="ignore"))
+    return text
+
+
 def log_files(directory):
     files = {}
     for index, name in enumerate(LOG_FILES, 1):
-        text = read(Path(directory) / name)
-        if name == "build.log":
-            rows = text.splitlines()
-            kept = [row for row in rows if not NINJA_PROGRESS.match(row)]
-            if len(kept) < len(rows):
-                text = f"({len(rows) - len(kept)} ninja progress lines removed)\n" + "\n".join(kept) + "\n"
-        if not text.strip():
-            continue
-        data = text.encode()
-        if len(data) > MAX_LOG_BYTES:
-            head, tail = data[:MAX_LOG_BYTES // 3], data[-(MAX_LOG_BYTES * 2 // 3):]
-            text = (head.decode(errors="ignore") + f"\n\n… {len(data) - len(head) - len(tail)} bytes cut; "
-                    "the full file is on the test machine …\n\n" + tail.decode(errors="ignore"))
-        files[f"{index:02d}-{name}"] = {"content": text}
-    for index, name in enumerate(("status.txt", "tests.patch", "apply.log", "build.log", "confirm-1.log"), 30):
-        text = read(Path(directory) / "main-tests" / name)
+        text = log_text(Path(directory) / name)
         if text.strip():
-            files[f"{index:02d}-main-with-pr-tests-{name}"] = {"content": text[-MAX_LOG_BYTES:]}
+            files[f"{index:02d}-{name}"] = {"content": text}
+    for index, name in enumerate(("status.txt", "tests.patch", "apply.log", "build.log", "confirm-1.log"), 30):
+        text = log_text(Path(directory) / "main-tests" / name)
+        if text.strip():
+            files[f"{index:02d}-main-with-pr-tests-{name}"] = {"content": text}
     return files
 
 
