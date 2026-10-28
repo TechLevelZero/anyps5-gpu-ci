@@ -14,6 +14,10 @@ NINJA_PROGRESS = re.compile(r"^\[\d+/\d+\] (Building|Linking|Generating|Creating
 LOG_FILES = ("steps.tsv", "infra.txt", "configure.log", "registration.log", "build.log", "libs.log", "select.log",
              "cputests.log", "tests.log", "rerun.log", "confirm-1.log", "confirm-2.log", "skips.log", "container.log")
 MAX_LOG_BYTES = 900_000
+LOG_NOISE = re.compile(r"^\[src/|^\[(gpu|float-controls|memory|vulkan)\]|^\s*Objects: \d+|Validation (Error|Warning):|"
+                       r"^\s*\[\d+\] 0x[0-9a-f]+|^Internal ctest|^Test project|^\s*Start\s+\d+:")
+FAILURE_LINE = re.compile(r"FAILED|[Ff]ail|[Aa]ssert|[Ee]xpected|mismatch|did not match|differ|[Aa]bort|"
+                          r"Segmentation|terminate|exception|\berror\b", re.MULTILINE)
 
 
 def read(path):
@@ -99,6 +103,8 @@ def load_run(directory):
         "skips_log": read(directory / "skips.log"),
         "skips_ok": steps.get("skips", (0,))[0] == 0,
         "container_code": read(directory / "container.code").strip(),
+        "main_tests": {"state": read(directory / "main-tests" / "status.txt").strip(),
+                       "tests": parse_junit(directory / "main-tests" / "confirm-1.xml") or {}},
     }
 
 
@@ -175,6 +181,26 @@ def split_confirmed(new_vuids, confirm):
     return confirmed, intermittent
 
 
+def new_failures(result, base, unstable):
+    base_failed = set(base["failed"]) if base else set()
+    base_failed |= {n for n, (k, total) in (unstable or {}).items() if k == total}
+    return [n for n in result["failed"] if n not in base_failed and n not in (unstable or {})]
+
+
+def failure_excerpt(text, limit=40):
+    rows = [r for r in text.splitlines() if r.strip() and not LOG_NOISE.search(r)]
+    picked, seen = [], set()
+    for i, row in enumerate(rows):
+        if FAILURE_LINE.search(row):
+            for j in range(i, min(len(rows), i + 4)):
+                if j not in seen:
+                    seen.add(j)
+                    picked.append(rows[j][:300])
+            if len(picked) >= limit:
+                break
+    return "\n".join(picked[:limit]) or "\n".join(r[:300] for r in rows[-15:])
+
+
 def tail(text, lines=25):
     rows = [r for r in text.strip().splitlines() if r.strip()]
     return "\n".join(rows[-lines:])
@@ -211,6 +237,10 @@ def log_files(directory):
             text = (head.decode(errors="ignore") + f"\n\n… {len(data) - len(head) - len(tail)} bytes cut; "
                     "the full file is on the test machine …\n\n" + tail.decode(errors="ignore"))
         files[f"{index:02d}-{name}"] = {"content": text}
+    for index, name in enumerate(("status.txt", "tests.patch", "apply.log", "build.log", "confirm-1.log"), 30):
+        text = read(Path(directory) / "main-tests" / name)
+        if text.strip():
+            files[f"{index:02d}-main-with-pr-tests-{name}"] = {"content": text[-MAX_LOG_BYTES:]}
     return files
 
 
@@ -246,17 +276,25 @@ def render(ctx, result, base):
     number = ctx["number"]
     header_rows = [f"PR head `{short(ctx['head'])}` merged onto main `{short(ctx['main'])}` · "
                    f"tested {ctx['finished']:%Y-%m-%d %H:%M} UTC · {fmt_duration(ctx['duration'])}", ""]
-    repro = (f"    git fetch origin pull/{number}/head && git checkout {ctx['main'][:12]} && git merge --no-ff FETCH_HEAD\n"
+    settings = ctx.get("settings") or {}
+    gpu_env = "ANYPS5_REQUIRE_VULKAN=1 ANYPS5_NO_SHADER_CACHE=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+    repro = (f"    git fetch origin {ctx['head']} {ctx['main']}\n"
+             f"    git checkout {ctx['main']} && git merge --no-ff {ctx['head']}\n"
              "    git submodule update --init --recursive\n"
              "    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DANYPS5_ENABLE_SPIRV_TOOLS=ON\n"
              "    cmake --build build && cmake --build build --target libs\n"
-             "    ctest --test-dir build -E '" + ctx["validation_tests"] + "' --output-on-failure\n"
-             "    ANYPS5_REQUIRE_VULKAN=1 ANYPS5_NO_SHADER_CACHE=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \\\n"
-             "      ctest --test-dir build -R '" + ctx["validation_tests"] + "' --output-on-failure\n")
+             "    VK_DRIVER_FILES=/nonexistent/icd.json ctest --test-dir build -E '" + ctx["validation_tests"] + "' "
+             f"--timeout 120 --parallel {settings.get('cpu_parallel', 32)} --output-on-failure\n"
+             f"    {gpu_env} \\\n"
+             "      ctest --test-dir build -R '" + ctx["validation_tests"] + "' "
+             f"--timeout 120 --parallel {settings.get('gpu_parallel', 4)} --output-on-failure\n"
+             "    # failures are then re-run alone: --timeout 360 --parallel 2; new validation IDs: the test alone, "
+             "twice, --parallel 1\n")
     footer = ("\n<sub>Automated build and test on a contributor's NVIDIA machine; it does not replace upstream CI. "
               "A new comment is posted for each new push. "
               + (f"[Full logs]({ctx['logs_url']}).</sub>\n" if ctx.get("logs_url") else "Full logs are kept on the test machine.</sub>\n"))
     summary = {"counts": {}, "new_vuids": 0}
+    focused = []
 
     if ctx["status"] == "conflict":
         body = (f"{ctx['marker']}\n## ⚠️ NVIDIA GPU test: needs rebase\n\n{header_rows[0]}\n\n"
@@ -295,7 +333,29 @@ def render(ctx, result, base):
         summary["counts"] = dict(counts)
         unstable = ctx.get("main_unstable") or {}
         base_failed |= {n for n, (k, total) in unstable.items() if k == total}
-        new_fail = [n for n in result["failed"] if n not in base_failed and n not in unstable]
+        new_fail = new_failures(result, base, unstable)
+        main_tests = result["main_tests"]
+        tests_changed = bool(ctx.get("test_paths"))
+
+        def attribution(name):
+            if not tests_changed:
+                return ("regression", "✅ passed" if base_tests.get(name, {}).get("status") == "passed"
+                        else base_tests.get(name, {}).get("status", "not on main"))
+            state = main_tests["state"]
+            if state != "ok":
+                return "uncompared", {"patch-failed": "not compared: the PR's test changes do not apply to main",
+                                      "build-failed": "not compared: the PR's tests do not build without its other changes"
+                                      }.get(state, "not compared")
+            status = main_tests["tests"].get(name, {}).get("status")
+            if status == "passed":
+                return "regression", "✅ passed"
+            if status == "failed":
+                return "candidate", "❌ also fails"
+            return "uncompared", "not compared: test not defined on main with the PR's test changes"
+
+        attributed = {n: attribution(n) for n in new_fail}
+        focused = list(new_fail)
+        kinds = collections.Counter(kind for kind, _ in attributed.values())
         unstable_fail = [n for n in result["failed"] if n not in base_failed and n in unstable]
         old_fail = [n for n in result["failed"] if n in base_failed]
         new_vuids, existing, missing, uncompared = validation_compare(result["validation"], (base or {}).get("validation"))
@@ -309,7 +369,14 @@ def render(ctx, result, base):
         test_icon = "❌" if new_fail else "✅"
         failed_cell = f"{counts['failed']} failed"
         if result["failed"]:
-            failed_cell += (f" ({'**' if new_fail else ''}{len(new_fail)} new{'**' if new_fail else ''}, "
+            if not tests_changed:
+                new_part = f"**{len(new_fail)} new**" if new_fail else "0 new"
+            else:
+                parts = [f"{kinds[k]} {label}" for k, label in (("regression", "pass on main with the PR's tests"),
+                         ("candidate", "fail on main with the PR's tests too"), ("uncompared", "not compared"))
+                         if kinds[k]]
+                new_part = f"**{len(new_fail)} new**" + (f": {', '.join(parts)}" if parts else "")
+            failed_cell += (f" ({new_part}, "
                             f"{len(old_fail)} also fail on main"
                             + (f", {len(unstable_fail)} unstable on main" if unstable_fail else "") + ")")
         test_cell = (f"{test_icon} {counts['passed']:,} passed · {failed_cell} · "
@@ -336,16 +403,22 @@ def render(ctx, result, base):
         table.append("| Slow tests (>30 s, GPU tests timed with validation layers) | " + (", ".join(f"⚠️ `{n}` {t:.1f} s" for t, n in slow[:5]) or "none") + " |")
 
         if new_fail:
-            rows = ["### Failing tests", "", "| Test | Result | On main `" + short(ctx["main"]) + "` |", "|---|---|---|"]
+            if tests_changed:
+                column = f"Same test on main `{short(ctx['main'])}` (main + this PR's test changes only)"
+                note = ("This PR changes test files, so each failing test was also built and run on main with only "
+                        "the PR's test changes applied. ✅ there means the failure comes from the PR's other "
+                        "changes; ❌ means the test fails on main too, so this run does not show the PR caused it.\n")
+            else:
+                column, note = f"On main `{short(ctx['main'])}`", ""
+            rows = ["### Failing tests", "", note, f"| Test | With this PR | {column} |", "|---|---|---|"]
             for name in new_fail:
-                on_main = base_tests.get(name, {}).get("status", "not on main")
-                rows.append(f"| `{name}` | ❌ failed | {'✅ passed' if on_main == 'passed' else on_main} |")
-            sections.append("\n".join(rows) + "\n")
+                rows.append(f"| `{name}` | ❌ failed | {attributed[name][1]} |")
+            sections.append("\n".join(r for r in rows if r != "") + "\n")
             for name in new_fail[:8]:
                 reason = tests[name]["message"] or "failed"
                 retried = " (also failed when re-run alone)" if name in (result.get("retried") or ()) else ""
-                sections.append(details(f"{name}: {reason}{retried}, log excerpt",
-                                        f"ctest: {reason}\n\n{tail(tests[name]['output'])}"))
+                sections.append(details(f"{name}: {reason}{retried}, assertion and diagnostics",
+                                        f"ctest: {reason}\n\n{failure_excerpt(tests[name]['output'])}"))
         if new_vuids:
             rows = ["### New validation errors", "", "| ID | main | PR | PR, test re-run alone | Test |", "|---|---|---|---|---|"]
             for test, ids in new_vuids.items():
@@ -372,9 +445,12 @@ def render(ctx, result, base):
             sections.append(details(f"Failing on main too ({len(old_fail)}, not counted against this PR)",
                                     "\n".join(old_fail)))
         if result["flaky"]:
+            seen = ctx.get("flaky_seen") or {}
             sections.append(details(f"Passed on retry ({len(result['flaky'])}, failed in the parallel run, passed when "
                                     "re-run with a 360 s timeout; not counted against this PR)",
                                     "\n".join(f"{n}: {result['flaky_reasons'].get(n, 'failed')} in the parallel run"
+                                              + (f"; also passed only on retry in {seen[n]} other runs in the last 7 days"
+                                                 if seen.get(n) else "")
                                               for n in result["flaky"])))
         if uncompared:
             sections.append(details(f"Validated but not compared ({len(uncompared)}, not in the main baseline's "
@@ -386,7 +462,7 @@ def render(ctx, result, base):
                     by_id.setdefault(i, []).append(t)
             sections.append(details(
                 f"Validation IDs already present on main ({len(by_id)} IDs in {len(existing)} tests)",
-                "\n".join(f"{i} ({len(ts)} test{'s' if len(ts) != 1 else ''}):{', '.join(sorted(ts)[:8])}"
+                "\n".join(f"{i} ({len(ts)} test{'s' if len(ts) != 1 else ''}): {', '.join(sorted(ts)[:8])}"
                           + (f", and {len(ts) - 8} more" if len(ts) > 8 else "")
                           for i, ts in sorted(by_id.items(), key=lambda kv: (-len(kv[1]), kv[0])))))
         skipped = sorted(n for n, t in tests.items() if t["status"] == "skipped")
@@ -400,7 +476,9 @@ def render(ctx, result, base):
             outcome, icon, word = "passed", "✅", "passed"
 
     body = "\n".join([ctx["marker"], f"## {icon} NVIDIA GPU test: {word}", "", header_rows[0], "", *table, "",
-                      *sections, details("Reproduce", repro.replace("    ", "")), footer])
+                      *sections, details("Reproduce", (repro + (
+                          f"    # the failing tests, on this merge and on main:\n    {gpu_env} \\\n      ctest --test-dir build -R '^("
+                          + "|".join(re.escape(n) for n in focused) + ")$' --parallel 1 -V\n" if focused else "")).replace("    ", "")), footer])
     if len(body) > MAX_COMMENT:
         body = body[:MAX_COMMENT] + "\n\n…truncated; see the full logs.\n" + footer
     return outcome, body, summary

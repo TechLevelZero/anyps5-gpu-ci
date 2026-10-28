@@ -548,6 +548,52 @@ def eligible(pr, main_sha):
     return any(p.startswith(prefix) for p in paths for prefix in CFG["gpu_paths"])
 
 
+def test_paths(main_sha, head):
+    changed = git("diff", "--name-only", f"{main_sha}...{head}", cwd=MIRROR, check=False).stdout.split()
+    return [p for p in changed if "/tests/" in f"/{p}"]
+
+
+def compare_on_main(number, main_sha, head, run_dir, paths, failing):
+    out = run_dir / "main-tests"
+    out.mkdir(exist_ok=True)
+    tree = TREES / f"pr-{number}-main"
+    src, build = tree / "src", tree / "build"
+    try:
+        checkout_tree(src, main_sha)
+        ffmpeg = ffmpeg_dir(src)
+        patch = git("diff", "--binary", f"{main_sha}...{head}", "--", *paths, cwd=MIRROR).stdout
+        (out / "tests.patch").write_text(patch)
+        applied = subprocess.run(["git", "apply", "--3way", "-"], input=patch, cwd=src, capture_output=True, text=True)
+        if applied.returncode:
+            (out / "apply.log").write_text(applied.stdout + applied.stderr)
+            (out / "status.txt").write_text("patch-failed")
+            return
+        with BUILD_SLOTS:
+            run_container(f"anyps5-run-pr{number}-main-build", "build", src, build, out, ffmpeg,
+                          writable_cache=False, extra_env={"CPU_TESTS": 0})
+        if not report.load_run(out)["build_ok"]:
+            (out / "status.txt").write_text("build-failed")
+            return
+        pattern = "^(" + "|".join(re.escape(t) for t in failing) + ")$"
+        with GPU_SLOTS:
+            run_container(f"anyps5-run-pr{number}-main-test", "confirm", src, build, out, ffmpeg,
+                          writable_cache=False, extra_env={"CONFIRM_TESTS": pattern, "CONFIRM_REPEAT": 1})
+        (out / "status.txt").write_text("ok")
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+
+
+def flaky_seen(state, now):
+    history = state.get("flaky_history", {})
+    return {name: sum(1 for t in times if now - t < 7 * 86400) for name, times in history.items()}
+
+
+def record_flaky(state, names, now):
+    history = state.setdefault("flaky_history", {})
+    for name in names:
+        history[name] = [t for t in history.get(name, []) if now - t < 7 * 86400] + [now]
+
+
 def publish_result(pr, entry):
     number = str(pr["number"])
     for labels in list(M_RESULT._metrics):
@@ -624,13 +670,24 @@ def run_pr(state, gh, baselines, pr, main_sha):
                 M_DURATION.labels("test").set(seconds)
                 if oom or code == "timeout":
                     status, infra = "infra", f"test container {'ran out of memory' if oom else 'timed out'}"
+                elif baselines.events[base_key].is_set():
+                    paths = test_paths(main_sha, head)
+                    failing = report.new_failures(report.load_run(run_dir), report.load_run(BASELINES / base_key),
+                                                  main_unstable(state))
+                    if paths and failing:
+                        set_stage(key, "compare_main")
+                        compare_on_main(number, main_sha, head, run_dir, paths, failing)
         set_stage(key, "report")
         result = report.load_run(run_dir) if status == "ok" else None
         base = report.load_run(baselines.wait(base_key)) if status == "ok" else None
         context = {"repo": CFG["repo"], "number": number, "head": head, "main": main_sha,
                    "status": status, "marker": CFG["marker"], "host": host_info(),
                    "finished": datetime.now(timezone.utc), "duration": time.time() - started,
-                   "validation_tests": CFG["validation_tests"], "main_unstable": main_unstable(state)}
+                   "validation_tests": CFG["validation_tests"], "main_unstable": main_unstable(state),
+                   "test_paths": test_paths(main_sha, head) if status == "ok" else [],
+                   "settings": {"gpu_parallel": CFG["test_parallel"], "cpu_parallel": CFG["cpu_test_parallel"]}}
+        with STATE_LOCK:
+            context["flaky_seen"] = flaky_seen(state, time.time())
         if CFG["post"] and CFG["gist_logs"] and status == "ok":
             try:
                 context["logs_url"] = gh.create_gist(
@@ -660,6 +717,8 @@ def run_pr(state, gh, baselines, pr, main_sha):
                 log(f"PR #{number}: posting failed: {error.code} {error.read()[:300]!r}")
         with STATE_LOCK:
             state["prs"][key] = entry
+            if result:
+                record_flaky(state, result["flaky"], time.time())
             save_state(state)
         publish_result(pr, entry)
         for old in sorted((RUNS / f"pr-{number}").iterdir(), key=lambda p: p.stat().st_mtime)[:-3]:

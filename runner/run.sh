@@ -43,7 +43,7 @@ if [ "$PHASE" = build ]; then
         [ -f "$BUILD/select.tests" ] && cp "$BUILD/select.tests" "$OUT/select.tests"
     fi
     ctest --test-dir "$BUILD" -N > "$OUT/all-tests.txt" 2>&1
-    if [ "$BUILD_CODE" = 0 ] && [ "$LIBS_CODE" = 0 ]; then
+    if [ "$BUILD_CODE" = 0 ] && [ "$LIBS_CODE" = 0 ] && [ "${CPU_TESTS:-1}" = 1 ]; then
         SELECT=()
         [ -s "$BUILD/select.tests" ] && SELECT=(-I "$(tr -d '[:space:]' < "$BUILD/select.tests")")
         step cputests env VK_DRIVER_FILES=/nonexistent/icd.json \
