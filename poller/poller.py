@@ -85,7 +85,7 @@ UPSTREAM = f"https://github.com/{CFG['repo']}.git"
 FFMPEG_URL = "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/{sha}/ffmpeg-linux-x64.zip"
 MAX_INFRA_ATTEMPTS = 3
 MAIN_HISTORY = 10
-TEST_CONFIG = "single-gpu-pass-validation"
+TEST_CONFIG = "single-gpu-pass-validation-uffd"
 STAGES = ("prepare", "wait_build", "build", "wait_gpu", "test", "report")
 
 M_CYCLE = Gauge("anyps5ci_last_cycle_timestamp_seconds", "End of the last PR list refresh")
@@ -350,6 +350,7 @@ def run_container(name, phase, src, build, out, ffmpeg, writable_cache, extra_en
         env.update({"CCACHE_DIR": "/ccache-main", "CCACHE_READONLY": "true", "CCACHE_TEMPDIR": "/tmp/ccache-tmp"})
     cmd = ["docker", "run", "--name", name, "--network", "none",
            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--security-opt", f"seccomp={Path(__file__).with_name('seccomp.json')}",
            "--pids-limit", "32768", "--shm-size", "8g",
            "--read-only", "--tmpfs", "/tmp:rw,exec,size=16g",
            "--user", f"{CFG['uid']}:{CFG['gid']}", "--label", "anyps5-gpu-ci=runner"]

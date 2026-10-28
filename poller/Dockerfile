@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir prometheus-client==0.21.1
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
-COPY poller.py report.py stats.py /app/
+COPY poller.py report.py stats.py seccomp.json /app/
 WORKDIR /app
 ENV HOME=/tmp PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "/app/poller.py"]
