@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: poller
+    static_configs: [{targets: ["poller:9200"]}]
+  - job_name: stats
+    scrape_interval: 60s
+    static_configs: [{targets: ["stats:9201"]}]
+  - job_name: node
+    static_configs: [{targets: ["node-exporter:9100"]}]
+  - job_name: cadvisor
+    static_configs: [{targets: ["cadvisor:8080"]}]
+  - job_name: gpu
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    static_configs: [{targets: ["gpu-exporter:9835"]}]
