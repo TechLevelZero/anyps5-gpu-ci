@@ -41,6 +41,7 @@ CFG = {
     "token": ENV.get("GITHUB_TOKEN", "").strip(),
     "repo": ENV.get("GITHUB_REPO", "boykopovar/AnyPS5").strip(),
     "post": env_bool("POST_COMMENTS"),
+    "post_conflicts": env_bool("POST_MERGE_CONFLICTS"),
     "gist_logs": env_bool("GIST_LOGS", True),
     "marker": ENV.get("COMMENT_MARKER", "<!-- anyps5-nvidia-ci -->").strip(),
     "filter": ENV.get("PR_FILTER", "gpu-paths").strip(),
@@ -736,7 +737,7 @@ def run_pr(state, gh, baselines, pr, main_sha):
             entry["infra"] = infra
         M_RUNS.labels(outcome).inc()
         M_DURATION.labels("pr").set(time.time() - started)
-        if CFG["post"] and outcome != "infra-error":
+        if CFG["post"] and outcome != "infra-error" and (outcome != "merge-conflict" or CFG["post_conflicts"]):
             try:
                 entry["comment"] = gh.post_comment(number, head, body, CFG["marker"])
             except urllib.error.HTTPError as error:
