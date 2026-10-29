@@ -48,6 +48,7 @@ CFG = {
     "include": {int(n) for n in env_list("INCLUDE_PRS") if n.isdigit()},
     "exclude": {int(n) for n in env_list("EXCLUDE_PRS") if n.isdigit()},
     "skip_drafts": env_bool("SKIP_DRAFTS", True),
+    "skip_stub_only": env_bool("SKIP_STUB_ONLY", True),
     "max_age_days": env_int("MAX_PR_AGE_DAYS", 30),
     "interval": env_int("POLL_INTERVAL_SECONDS", 900),
     "baseline_interval": env_int("BASELINE_INTERVAL_MINUTES", 360) * 60,
@@ -268,6 +269,28 @@ def changed_paths(main_sha, head):
     if result.returncode:
         return None
     return [p for p in result.stdout.split("\0") if p]
+
+
+STUB_LINE = re.compile(r"""^(
+    | [{}];? | extern\s+"C"\s*\{ | \#include\s+\S+ | \#pragma\s+once
+    | NotImplemented_nid_no_patch\(__func__\); | APS5_EXPORT\("[^"]*",\s*\w+\);
+    | return\s*(-?\w+|\{\})?\s*;
+    | \(void\)\s*\w+;
+    | (?!(if|for|while|switch|return|else|case|delete|new)\b)[\w:<>*&\s]+[\s*&]\w+\s*\(
+      [^;={}]*(\)\s*(const\s*)?(\{|;)?|,)
+    | [\w:<>*&\s]+[\s*&]\w+(\[\w*\])?\s*(,|\)\s*(const\s*)?(\{|;)?)
+    )$""", re.X)
+STUB_CACHE = {}
+
+
+def stub_only(main_sha, head, paths):
+    key = (main_sha, head)
+    if key not in STUB_CACHE:
+        files = [p for p in paths if not p.endswith(".md")]
+        diff = git("diff", "-U0", f"{main_sha}...{head}", "--", *files, cwd=MIRROR, check=False).stdout if files else ""
+        STUB_CACHE[key] = all(STUB_LINE.match(line[1:].strip()) for line in diff.splitlines()
+                              if line[:1] in "+-" and not line.startswith(("+++", "---")))
+    return STUB_CACHE[key]
 
 
 def based_on_newer_main(main_sha, newest_main, head):
@@ -545,7 +568,10 @@ def eligible(pr, main_sha):
     paths = changed_paths(main_sha, pr["head"]["sha"])
     if paths is None:
         return False
-    return any(p.startswith(prefix) for p in paths for prefix in CFG["gpu_paths"])
+    gpu = [p for p in paths if any(p.startswith(prefix) for prefix in CFG["gpu_paths"])]
+    if not gpu:
+        return False
+    return not (CFG["skip_stub_only"] and stub_only(main_sha, pr["head"]["sha"], gpu))
 
 
 def test_paths(main_sha, head):
@@ -553,7 +579,7 @@ def test_paths(main_sha, head):
     return [p for p in changed if "/tests/" in f"/{p}"]
 
 
-def compare_on_main(number, main_sha, head, run_dir, paths, failing):
+def compare_on_main(number, main_sha, head, run_dir, paths, compare):
     out = run_dir / "main-tests"
     out.mkdir(exist_ok=True)
     tree = TREES / f"pr-{number}-main"
@@ -574,10 +600,10 @@ def compare_on_main(number, main_sha, head, run_dir, paths, failing):
         if not report.load_run(out)["build_ok"]:
             (out / "status.txt").write_text("build-failed")
             return
-        pattern = "^(" + "|".join(re.escape(t) for t in failing) + ")$"
+        pattern = "^(" + "|".join(re.escape(t) for t in compare) + ")$"
         with GPU_SLOTS:
             run_container(f"anyps5-run-pr{number}-main-test", "confirm", src, build, out, ffmpeg,
-                          writable_cache=False, extra_env={"CONFIRM_TESTS": pattern, "CONFIRM_REPEAT": 1})
+                          writable_cache=False, extra_env={"CONFIRM_TESTS": pattern, "CONFIRM_REPEAT": 2})
         (out / "status.txt").write_text("ok")
     finally:
         shutil.rmtree(tree, ignore_errors=True)
@@ -672,11 +698,12 @@ def run_pr(state, gh, baselines, pr, main_sha):
                     status, infra = "infra", f"test container {'ran out of memory' if oom else 'timed out'}"
                 elif baselines.events[base_key].is_set():
                     paths = test_paths(main_sha, head)
-                    failing = report.new_failures(report.load_run(run_dir), report.load_run(BASELINES / base_key),
-                                                  main_unstable(state))
-                    if paths and failing:
+                    current, base_run = report.load_run(run_dir), report.load_run(BASELINES / base_key)
+                    compare = sorted(set(report.new_failures(current, base_run, main_unstable(state)))
+                                     | set(report.confirmed_validation_tests(current, base_run)))
+                    if paths and compare:
                         set_stage(key, "compare_main")
-                        compare_on_main(number, main_sha, head, run_dir, paths, failing)
+                        compare_on_main(number, main_sha, head, run_dir, paths, compare)
         set_stage(key, "report")
         result = report.load_run(run_dir) if status == "ok" else None
         base = report.load_run(baselines.wait(base_key)) if status == "ok" else None

@@ -104,7 +104,8 @@ def load_run(directory):
         "skips_ok": steps.get("skips", (0,))[0] == 0,
         "container_code": read(directory / "container.code").strip(),
         "main_tests": {"state": read(directory / "main-tests" / "status.txt").strip(),
-                       "tests": parse_junit(directory / "main-tests" / "confirm-1.xml") or {}},
+                       "tests": parse_junit(directory / "main-tests" / "confirm-1.xml") or {},
+                       "runs": [parse_junit(p) or {} for p in sorted((directory / "main-tests").glob("confirm-*.xml"))]},
     }
 
 
@@ -179,6 +180,12 @@ def split_confirmed(new_vuids, confirm):
             target = confirmed if seen else intermittent
             target.setdefault(test, {})[vuid] = (count, seen)
     return confirmed, intermittent
+
+
+def confirmed_validation_tests(result, base):
+    new, _, _, _ = validation_compare(result["validation"], (base or {}).get("validation"))
+    confirmed, _ = split_confirmed(new, result["confirm"])
+    return sorted(confirmed)
 
 
 def new_failures(result, base, unstable):
@@ -357,14 +364,36 @@ def render(ctx, result, base):
                 return "candidate", "❌ also fails"
             return "uncompared", "not compared: test not defined on main with the PR's test changes"
 
+        def vuid_attribution(test, vuid):
+            if not tests_changed:
+                return "regression", None
+            state = main_tests["state"]
+            if state != "ok":
+                return "uncompared", {"patch-failed": "not compared: test changes do not apply to main",
+                                      "build-failed": "not compared: tests do not build on main"}.get(state, "not compared")
+            runs = [run[test] for run in main_tests["runs"] if test in run]
+            if not runs:
+                return "uncompared", "not compared: test not defined on main"
+            seen = sum(run["diagnostics"].get(vuid, 0) for run in runs)
+            if seen:
+                return "exposed", f"{seen} (in {len(runs)} runs)"
+            return "regression", "0 (the test fails there)" if any(r["status"] == "failed" for r in runs) else "0"
+
         attributed = {n: attribution(n) for n in new_fail}
-        focused = list(new_fail)
         kinds = collections.Counter(kind for kind, _ in attributed.values())
         unstable_fail = [n for n in result["failed"] if n not in base_failed and n in unstable]
         old_fail = [n for n in result["failed"] if n in base_failed]
         new_vuids, existing, missing, uncompared = validation_compare(result["validation"], (base or {}).get("validation"))
         new_vuids, intermittent = split_confirmed(new_vuids, result["confirm"])
+        vuid_kinds = {(t, v): vuid_attribution(t, v) for t, ids in new_vuids.items() for v in ids}
+        exposed = {}
+        for (t, v), (kind, _) in vuid_kinds.items():
+            if kind == "exposed":
+                exposed.setdefault(t, {})[v] = new_vuids[t].pop(v)
+        new_vuids = {t: ids for t, ids in new_vuids.items() if ids}
         summary["new_vuids"] = sum(len(v) for v in new_vuids.values())
+        summary["exposed_vuids"] = sum(len(v) for v in exposed.values())
+        focused = list(new_fail) + [t for t in [*new_vuids, *exposed] if t not in new_fail]
         slow = sorted(((t["time"], n) for n, t in tests.items() if t["time"] > SLOW_SECONDS), reverse=True)
 
         table.append("| Build | ✅ passed (Release, `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`) |")
@@ -401,6 +430,12 @@ def render(ctx, result, base):
             table.append(f"| Vulkan validation | ❌ validation layer not loaded in {len(missing)} tests |")
         elif new_vuids:
             table.append(f"| Vulkan validation | ❌ **{summary['new_vuids']} new validation ID(s)** vs main "
+                         f"({validated} tests run on the GPU)"
+                         + (f"; {summary['exposed_vuids']} more come from main's code, exposed by this PR's tests"
+                            if exposed else "") + " |")
+        elif exposed:
+            table.append(f"| Vulkan validation | ⚠️ no new validation IDs from this PR's code; "
+                         f"{summary['exposed_vuids']} come from main's code, exposed by this PR's tests "
                          f"({validated} tests run on the GPU) |")
         else:
             table.append(f"| Vulkan validation | ✅ no new validation IDs vs main ({validated} tests run on the GPU) |")
@@ -423,17 +458,31 @@ def render(ctx, result, base):
                 retried = " (also failed when re-run alone)" if name in (result.get("retried") or ()) else ""
                 sections.append(details(f"{name}: {reason}{retried}, assertion and diagnostics",
                                         f"ctest: {reason}\n\n{failure_excerpt(tests[name]['output'])}"))
-        if new_vuids:
-            rows = ["### New validation errors", "", "| ID | main | PR | PR, test re-run alone | Test |", "|---|---|---|---|---|"]
-            for test, ids in new_vuids.items():
+        def vuid_section(title, note, groups, label):
+            main_column = " main + this PR's test changes only |" if tests_changed else ""
+            rows = [title, "", note, f"| ID | Test | main `{short(ctx['main'])}` |{main_column} PR | PR, test re-run alone |",
+                    "|---|---|---|" + ("---|" if tests_changed else "") + "---|---|"]
+            for test, ids in groups.items():
                 for vuid, (count, seen) in ids.items():
                     alone = "not re-run" if seen is None else f"{seen} (in {len(result['confirm'])} runs)"
-                    rows.append(f"| `{vuid}` | 0 | {count} | {alone} | `{test}` |")
-            sections.append("\n".join(rows) + "\n")
-            for test, ids in list(new_vuids.items())[:5]:
+                    on_main = f" {vuid_kinds[(test, vuid)][1]} |" if tests_changed else ""
+                    rows.append(f"| `{vuid}` | `{test}` | 0 |{on_main} {count} | {alone} |")
+            sections.append("\n".join(r for r in rows if r != "") + "\n")
+            for test, ids in list(groups.items())[:5]:
                 lines = [l for l in result["validation"][test]["output"].splitlines()
                          if MESSAGE.search(l) and any(i in l for i in ids)]
-                sections.append(details(f"{test}: new validation messages", "\n".join(l[:600] for l in lines[:10])))
+                sections.append(details(f"{test}: {label}", "\n".join(l[:600] for l in lines[:10])))
+
+        if new_vuids:
+            vuid_section("### New validation errors",
+                         "This PR changes test files, so each test below was also run on main with only the PR's "
+                         "test changes applied; 0 there means the PR's other changes cause the error.\n"
+                         if tests_changed else "", new_vuids, "new validation messages")
+        if exposed:
+            vuid_section("### Validation errors from main's code, exposed by this PR's tests",
+                         "These IDs also appear when main runs this PR's test changes without its other changes, so "
+                         "they come from code already on main. Not counted against this PR.\n",
+                         exposed, "validation messages, also on main with this PR's tests")
         if intermittent:
             sections.append(details(
                 f"Intermittent validation messages ({sum(len(v) for v in intermittent.values())}, seen once in the "
@@ -477,7 +526,7 @@ def render(ctx, result, base):
             outcome, icon, word = ("validation-failed" if not new_fail and result["tests"] is not None
                                    and result["registration_ok"] and (new_vuids or missing) else "tests-failed"), "❌", "failed"
         else:
-            outcome, icon, word = "passed", "✅", "passed"
+            outcome, icon, word = "passed", "⚠️" if exposed else "✅", "passed"
 
     body = "\n".join([ctx["marker"], f"## {icon} NVIDIA GPU test: {word}", "", header_rows[0], "", *table, "",
                       *sections, details("Reproduce", (repro + (
